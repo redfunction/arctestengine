@@ -7,63 +7,115 @@ class AllPhpUnitTestEngine extends ArcanistUnitTestEngine {
 
     private $configFile;
     private $phpunitBinary = 'phpunit';
-    private $affectedTests;
     private $projectRoot;
+    private $affectedFiles = array();
 
     public function run() {
         $this->projectRoot = $this->getWorkingCopy()->getProjectRoot();
-        $this->affectedTests = array();
         $this->prepareConfigFile();
-                
-        foreach ($this->getPaths() as $path) {
 
-            $path = Filesystem::resolvePath($path, $this->projectRoot);
-
-            // TODO: add support for directories
-            // Users can call phpunit on the directory themselves
-            if (is_dir($path)) {
-                continue;
+        $xmlConfig = simplexml_load_string(file_get_contents($this->configFile));
+        $configFilterDirectory = $xmlConfig->xpath('/phpunit/filter/whitelist/directory');
+        if(count($configFilterDirectory) != 0){
+            foreach ($configFilterDirectory as $directory)
+            {
+                $this->affectedFiles = array_merge($this->affectedFiles, $this->getFilesFromXmlDirectory($directory));
             }
+        }
+        $selectedAffectedFiles = [];
+        foreach ($this->getPaths() as $path)
+        {
+            $filePath = $this->projectRoot . '/' . $path;
+            if(in_array($filePath, $this->affectedFiles))
+                $selectedAffectedFiles[$filePath] = $filePath;
+        }
+        if(count($selectedAffectedFiles) != 0)
+            $this->affectedFiles = $selectedAffectedFiles;
 
-            // Not sure if it would make sense to go further if
-            // it is not a .php file
-            if (substr($path, -4) != '.php') {
-                continue;
+        $testFiles = array();
+        $testsuites = $xmlConfig->xpath('/phpunit/testsuites/testsuite');
+        foreach ($testsuites as $testsuite)
+        {
+            foreach ($testsuite->xpath('directory') as $directory)
+            {
+                $testFiles = array_merge($testFiles, $this->getFilesFromXmlDirectory($directory));
             }
-            
-            $this->affectedTests[$path] = "";
         }
 
-        if (empty($this->getPaths())) {
+        if (empty($testFiles)) {
             throw new ArcanistNoEffectException(pht('No tests to run.'));
         }
 
-        $json_tmp = new TempFile();
-        $clover_tmp = null;
-        $clover = null;
-        if ($this->getEnableCoverage() !== false) {
-            $clover_tmp = new TempFile();
-            $clover = csprintf('--coverage-clover %s', $clover_tmp);
+        $this->prepareConfigFile();
+        $futures = array();
+        $tmpfiles = array();
+        foreach ($testFiles as $class_path => $test_path) {
+            $json_tmp = new TempFile();
+            $clover_tmp = null;
+            $clover = null;
+            if ($this->getEnableCoverage() !== false) {
+                $clover_tmp = new TempFile();
+                $clover = csprintf('--coverage-clover %s', $clover_tmp);
+            }
+
+            $config = $this->configFile ? csprintf('-c %s', $this->configFile) : null;
+
+            $stderr = '-d display_errors=stderr';
+            $futures[$test_path] = new ExecFuture('%C %C %C --log-json %s %C %s',
+                $this->phpunitBinary, $config, $stderr, $json_tmp, $clover, $test_path);
+            $tmpfiles[$test_path] = array(
+                'json' => $json_tmp,
+                'clover' => $clover_tmp,
+            );
         }
-
-        $config = $this->configFile ? csprintf('-c %s', $this->configFile) : null;
-
-        $stderr = '-d display_errors=stderr';
-
-        $future = new ExecFuture('%C %C %C --log-json %s %C',
-            $this->phpunitBinary, $config, $stderr, $json_tmp, $clover);
 
         $results = array();
 
-        list($err, $stdout, $stderr) = $future->resolve();
-
-        $results[] = $this->parseTestResults(
-            "s",
-            $json_tmp,
-            $clover_tmp,
-            $stderr);
-
+        foreach ($futures as $test => $future) {
+            list($err, $stdout, $stderr) = $future->resolve();
+            $results[] = $this->parseTestResults(
+                $test,
+                $tmpfiles[$test]['json'],
+                $tmpfiles[$test]['clover'],
+                $stderr);
+        }
         return array_mergev($results);
+    }
+
+    private function getFilesFromXmlDirectory($xmlData)
+    {
+        if(empty($xmlData['suffix'])) return array();
+        $folderName = trim($xmlData);
+        if($folderName[0] == '.')
+            $folderName = substr($folderName,1, strlen($folderName) -1);
+        $folderName = pathinfo($folderName)['basename'];
+        return $this->getFiles($this->projectRoot . '/' . $folderName, (string)$xmlData['suffix']);
+    }
+
+    private function getFiles($folder, $suffix)
+    {
+        if(!is_dir($folder)) return [];
+        $foundFiles = [];
+        foreach (scandir($folder) as $value)
+        {
+            if(in_array($value, ['.', '..'])) continue;
+            if(is_dir($folder. '/' . $value))
+                $foundFiles = array_merge($foundFiles, $this->getFiles($folder. '/' . $value, $suffix));
+            else
+            {
+                if(!Filesystem::pathExists($folder. '/' . $value)) continue;
+                if ($this->endsWith($value, $suffix))
+                    $foundFiles[$folder. '/' . $value] = $folder. '/' . $value;
+            }
+        }
+        return $foundFiles;
+    }
+
+    private function endswith($string, $test) {
+        $strlen = strlen($string);
+        $testlen = strlen($test);
+        if ($testlen > $strlen) return false;
+        return substr_compare($string, $test, $strlen - $testlen, $testlen) === 0;
     }
 
     /**
@@ -82,54 +134,9 @@ class AllPhpUnitTestEngine extends ArcanistUnitTestEngine {
             ->setEnableCoverage($this->getEnableCoverage())
             ->setProjectRoot($this->projectRoot)
             ->setCoverageFile($clover_tmp)
-            ->setAffectedTests($this->affectedTests)
+            ->setAffectedTests($this->affectedFiles)
             ->setStderr($stderr)
             ->parseTestResults($path, $test_results);
-    }
-
-
-    /**
-     * Search for test cases for a given file in a large number of "reasonable"
-     * locations. See @{method:getSearchLocationsForTests} for specifics.
-     *
-     * TODO: Add support for finding tests in testsuite folders from
-     * phpunit.xml configuration.
-     *
-     * @param   string      PHP file to locate test cases for.
-     * @return  string|null Path to test cases, or null.
-     */
-    private function findTestFile($path) {
-        $root = $this->projectRoot;
-        $path = Filesystem::resolvePath($path, $root);
-
-        $file = basename($path);
-        $possible_files = array(
-            $file,
-            substr($file, 0, -4).'Test.php',
-        );
-
-        $search = self::getSearchLocationsForTests($path);
-
-        foreach ($search as $search_path) {
-            foreach ($possible_files as $possible_file) {
-                $full_path = $search_path.$possible_file;
-                if (!Filesystem::pathExists($full_path)) {
-                    // If the file doesn't exist, it's clearly a miss.
-                    continue;
-                }
-                if (!Filesystem::isDescendant($full_path, $root)) {
-                    // Don't look above the project root.
-                    continue;
-                }
-                if (0 == strcasecmp(Filesystem::resolvePath($full_path), $path)) {
-                    // Don't return the original file.
-                    continue;
-                }
-                return $full_path;
-            }
-        }
-
-        return null;
     }
 
 
